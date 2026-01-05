@@ -47,6 +47,7 @@ class Visualizer():
     """This class includes several functions that can display/save images and print/save logging information.
 
     It uses a Python library 'visdom' for display, and a Python library 'dominate' (wrapped in 'HTML') for creating HTML files with images.
+    Can also use wandb for logging if use_wandb is enabled.
     """
 
     def __init__(self, opt):
@@ -55,7 +56,7 @@ class Visualizer():
         Parameters:
             opt -- stores all the experiment flags; needs to be a subclass of BaseOptions
         Step 1: Cache the training/test options
-        Step 2: connect to a visdom server
+        Step 2: connect to a visdom server or initialize wandb
         Step 3: create an HTML object for saveing HTML filters
         Step 4: create a logging file to store training losses
         """
@@ -69,7 +70,27 @@ class Visualizer():
         self.name = opt.name
         self.port = opt.display_port
         self.saved = False
-        if self.display_id > 0:  # connect to a visdom server given <display_port> and <display_server>
+        self.use_wandb = getattr(opt, 'use_wandb', False)
+        self.wandb_step = 0  # Track wandb step counter
+        
+        # Initialize wandb if enabled
+        if self.use_wandb:
+            try:
+                import wandb
+                wandb_run_name = getattr(opt, 'wandb_run', None) or opt.name
+                wandb_project = getattr(opt, 'wandb_project', 'cut')
+                wandb.init(
+                    project=wandb_project,
+                    name=wandb_run_name,
+                    config=vars(opt),
+                    reinit=True
+                )
+                self.wandb = wandb
+                print(f'Initialized wandb: project={wandb_project}, run={wandb_run_name}')
+            except ImportError:
+                print('Warning: wandb not installed. Falling back to visdom/HTML.')
+                self.use_wandb = False
+        elif self.display_id > 0:  # connect to a visdom server given <display_port> and <display_server>
             import visdom
             self.plot_data = {}
             self.ncols = opt.display_ncols
@@ -80,6 +101,8 @@ class Visualizer():
                                          base_url=os.environ['tensorboard_base_url'] + '/visdom')
             if not self.vis.check_connection():
                 self.create_visdom_connections()
+        else:
+            self.plot_data = {}
 
         if self.use_html:  # create an HTML object at <checkpoints_dir>/web/; images will be saved under <checkpoints_dir>/web/images/
             self.web_dir = os.path.join(opt.checkpoints_dir, opt.name, 'web')
@@ -95,6 +118,11 @@ class Visualizer():
     def reset(self):
         """Reset the self.saved status"""
         self.saved = False
+    
+    def set_step(self, step):
+        """Set the wandb step counter"""
+        if self.use_wandb:
+            self.wandb_step = step
 
     def create_visdom_connections(self):
         """If the program could not connect to Visdom server, this function will start a new server at port < self.port > """
@@ -104,14 +132,38 @@ class Visualizer():
         Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
 
     def display_current_results(self, visuals, epoch, save_result):
-        """Display current results on visdom; save current results to an HTML file.
+        """Display current results on visdom or wandb; save current results to an HTML file.
 
         Parameters:
             visuals (OrderedDict) - - dictionary of images to display or save
             epoch (int) - - the current epoch
             save_result (bool) - - if save the current results to an HTML file
         """
-        if self.display_id > 0:  # show images in the browser using visdom
+        # Log images to wandb
+        if self.use_wandb:
+            try:
+                wandb_images = {}
+                for label, image in visuals.items():
+                    image_numpy = util.tensor2im(image)
+                    # Convert to PIL Image for wandb
+                    from PIL import Image as PILImage
+                    if image_numpy.dtype != np.uint8:
+                        image_numpy = image_numpy.astype(np.uint8)
+                    pil_image = PILImage.fromarray(image_numpy)
+                    wandb_images[f"images/{label}"] = self.wandb.Image(pil_image, caption=f"{label} (epoch {epoch})")
+                # Log images separately to avoid serialization issues
+                self.wandb.log(wandb_images, step=self.wandb_step, commit=False)
+            except Exception as e:
+                # Handle NumPy/pandas compatibility issues or other wandb errors
+                if "numpy" in str(e).lower() or "pandas" in str(e).lower():
+                    print(f"Warning: NumPy/pandas compatibility issue with wandb image logging.")
+                    print(f"Error: {e}")
+                    print("Tip: Try downgrading NumPy: pip install 'numpy<2'")
+                else:
+                    print(f"Warning: Failed to log images to wandb: {e}")
+                # Continue training without image logging
+        
+        if self.display_id > 0 and not self.use_wandb:  # show images in the browser using visdom
             ncols = self.ncols
             if ncols > 0:        # show all the images in one visdom panel
                 ncols = min(ncols, len(visuals))
@@ -189,7 +241,7 @@ class Visualizer():
             webpage.save()
 
     def plot_current_losses(self, epoch, counter_ratio, losses):
-        """display the current losses on visdom display: dictionary of error labels and values
+        """display the current losses on visdom or wandb: dictionary of error labels and values
 
         Parameters:
             epoch (int)           -- current epoch
@@ -199,6 +251,15 @@ class Visualizer():
         if len(losses) == 0:
             return
 
+        # Log losses to wandb
+        if self.use_wandb:
+            log_dict = {k: float(v) for k, v in losses.items()}
+            log_dict['epoch'] = epoch
+            log_dict['epoch_progress'] = counter_ratio
+            self.wandb.log(log_dict, step=self.wandb_step, commit=True)
+            return
+
+        # Fallback to visdom
         plot_name = '_'.join(list(losses.keys()))
 
         if plot_name not in self.plot_data:
@@ -209,18 +270,20 @@ class Visualizer():
 
         plot_data['X'].append(epoch + counter_ratio)
         plot_data['Y'].append([losses[k] for k in plot_data['legend']])
-        try:
-            self.vis.line(
-                X=np.stack([np.array(plot_data['X'])] * len(plot_data['legend']), 1),
-                Y=np.array(plot_data['Y']),
-                opts={
-                    'title': self.name,
-                    'legend': plot_data['legend'],
-                    'xlabel': 'epoch',
-                    'ylabel': 'loss'},
-                win=self.display_id - plot_id)
-        except VisdomExceptionBase:
-            self.create_visdom_connections()
+        
+        if hasattr(self, 'vis') and self.display_id > 0:
+            try:
+                self.vis.line(
+                    X=np.stack([np.array(plot_data['X'])] * len(plot_data['legend']), 1),
+                    Y=np.array(plot_data['Y']),
+                    opts={
+                        'title': self.name,
+                        'legend': plot_data['legend'],
+                        'xlabel': 'epoch',
+                        'ylabel': 'loss'},
+                    win=self.display_id - plot_id)
+            except VisdomExceptionBase:
+                self.create_visdom_connections()
 
     # losses: same format as |losses| of plot_current_losses
     def print_current_losses(self, epoch, iters, losses, t_comp, t_data):

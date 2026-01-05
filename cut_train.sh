@@ -22,7 +22,12 @@ HOST_WORKDIR="/home/anoopreh/scratch/projects/muse_multimodal_rl/src/cut"
 mkdir -p logs
 
 # --- Weights & Biases ---
-export WANDB_API_KEY=473f2523bc6fadec1110660439773faf8ec29e60
+# WANDB_API_KEY should be set as an environment variable or in your Compute Canada account
+# You can set it via: export WANDB_API_KEY=your_key_here
+# Or use Compute Canada's environment variable system
+if [ -z "$WANDB_API_KEY" ]; then
+    echo "Warning: WANDB_API_KEY not set. Wandb logging may fail."
+fi
 
 # (Optional) quick CUDA visibility check per task
 apptainer exec --nv -B "${HOST_WORKDIR}:/work" "${SIF_PATH}" bash -lc '

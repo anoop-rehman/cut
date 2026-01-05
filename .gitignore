@@ -47,4 +47,6 @@ test/data/legacy_serialized.pt
 .idea
 .venv
 wandb/*
+.wandb_key
+*.key
 logs/*
